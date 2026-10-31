@@ -1,8 +1,21 @@
 
 import os
+import logging
+from typing import Any
+
 import httpx
 
 from app.prompts import SYSTEM_PROMPT
+
+logger = logging.getLogger(__name__)
+
+
+class VoiceLinkConfigurationError(RuntimeError):
+    pass
+
+
+class VoiceLinkProviderError(RuntimeError):
+    pass
 
 
 class VoiceLinkAgent:
@@ -10,30 +23,60 @@ class VoiceLinkAgent:
     def __init__(self):
         self.base_url = os.getenv(
             "LLM_BASE_URL", ""
-        ).rstrip("/")
+        ).strip().rstrip("/")
 
-        self.api_key = os.getenv("LLM_API_KEY", "")
-        self.model = os.getenv("LLM_MODEL", "")
+        self.api_key = os.getenv(
+            "LLM_API_KEY", ""
+        ).strip()
 
-    async def reply(self, message: str, history=None) -> str:
+        self.model = os.getenv(
+            "LLM_MODEL", ""
+        ).strip()
 
-        if not message or not message.strip():
-            return "कृपया अपना सवाल बताइए।"
+    def is_configured(self) -> bool:
+        return bool(
+            self.base_url
+            and self.api_key
+            and self.model
+        )
 
-        if self.base_url and self.model:
-            if not self.api_key:
-                raise RuntimeError(
-                    "LLM_API_KEY is required"
-                )
+    async def reply(
+        self,
+        message: str,
+        history: list[dict[str, Any]] | None = None,
+    ) -> str:
 
-            return await self._ask_llm(
-                message.strip(),
-                history or [],
+        clean_message = (message or "").strip()
+
+        if not clean_message:
+            raise ValueError("Message cannot be empty")
+
+        missing = [
+            name
+            for name, value in (
+                ("LLM_BASE_URL", self.base_url),
+                ("LLM_API_KEY", self.api_key),
+                ("LLM_MODEL", self.model),
+            )
+            if not value
+        ]
+
+        if missing:
+            raise VoiceLinkConfigurationError(
+                "AI provider configuration missing: "
+                + ", ".join(missing)
             )
 
-        return self._demo_reply(message)
+        return await self._ask_llm(
+            clean_message,
+            history or [],
+        )
 
-    async def _ask_llm(self, message: str, history: list) -> str:
+    async def _ask_llm(
+        self,
+        message: str,
+        history: list[dict[str, Any]],
+    ) -> str:
 
         messages = [
             {
@@ -42,6 +85,7 @@ class VoiceLinkAgent:
             }
         ]
 
+        # Only accept user and assistant messages from history.
         for item in history[-8:]:
 
             if not isinstance(item, dict):
@@ -50,7 +94,10 @@ class VoiceLinkAgent:
             role = item.get("role")
             content = item.get("content")
 
-            if role in ("user", "assistant") and isinstance(content, str):
+            if (
+                role in ("user", "assistant")
+                and isinstance(content, str)
+            ):
                 cleaned = content.strip()[:2000]
 
                 if cleaned:
@@ -64,61 +111,74 @@ class VoiceLinkAgent:
             "content": message,
         })
 
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0, connect=10.0)
-        ) as client:
+        timeout = httpx.Timeout(
+            35.0,
+            connect=10.0,
+        )
 
-            response = await client.post(
-                f"{self.base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": self.model,
-                    "messages": messages,
-                    "temperature": 0.4,
-                },
-            )
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout
+            ) as client:
 
-            response.raise_for_status()
+                response = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": self.model,
+                        "messages": messages,
+                        "temperature": 0.4,
+                    },
+                )
+
+            if response.status_code >= 400:
+                logger.error(
+                    "LLM provider HTTP status: %s",
+                    response.status_code,
+                )
+
+                raise VoiceLinkProviderError(
+                    f"AI provider failed: HTTP {response.status_code}"
+                )
+
             data = response.json()
+
+        except httpx.TimeoutException as exc:
+            logger.exception("AI provider timeout")
+            raise VoiceLinkProviderError(
+                "AI provider timed out"
+            ) from exc
+
+        except httpx.RequestError as exc:
+            logger.exception("AI provider connection failed")
+            raise VoiceLinkProviderError(
+                "Cannot connect to AI provider"
+            ) from exc
+
+        except ValueError as exc:
+            logger.exception("Invalid AI provider JSON")
+            raise VoiceLinkProviderError(
+                "AI provider returned invalid JSON"
+            ) from exc
 
         try:
             content = data["choices"][0]["message"]["content"]
 
-        except (KeyError, IndexError, TypeError):
-            raise RuntimeError(
-                "AI provider returned an invalid response"
+        except (KeyError, IndexError, TypeError) as exc:
+            logger.error(
+                "Unexpected AI provider response structure"
             )
 
+            raise VoiceLinkProviderError(
+                "Invalid AI provider response"
+            ) from exc
+
         if not isinstance(content, str) or not content.strip():
-            raise RuntimeError(
+            raise VoiceLinkProviderError(
                 "AI provider returned an empty response"
             )
 
         return content.strip()
-
-    def _demo_reply(self, message: str) -> str:
-
-        text = message.lower()
-
-        if any(x in text for x in [
-            "bike", "बाइक", "motorcycle", "मोटरसाइकिल"
-        ]):
-            return "जी, आपका अनुमानित बजट कितना है?"
-
-        if any(x in text for x in [
-            "scooter", "स्कूटर"
-        ]):
-            return "जी, आप किस शहर में रहते हैं?"
-
-        if any(x in text for x in [
-            "price", "कीमत", "दाम"
-        ]):
-            return "आप किस Bajaj मॉडल की कीमत जानना चाहते हैं?"
-
-        return (
-            "नमस्ते! मैं VoiceLink AI Sales Assistant हूँ। "
-            "आप Bajaj की motorcycle देख रहे हैं या scooter?"
-        )
