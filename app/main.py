@@ -1,6 +1,7 @@
 
 import os
 import re
+import logging
 from typing import Any
 
 import httpx
@@ -8,18 +9,25 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
-from app.agent import VoiceLinkAgent
+from app.agent import (
+    VoiceLinkAgent,
+    VoiceLinkConfigurationError,
+    VoiceLinkProviderError,
+)
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="VoiceLink AI Agent",
     description="AI Sales Assistant for Dealerships",
-    version="0.3.1",
+    version="0.4.0",
 )
 
-# Allow requests from the VoiceLink customer website
+# CORS: allow the VoiceLink customer website domains
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://voicelink-customer.vercel.app",
         "https://voicelink-customer-amrish369s-projects.vercel.app",
         "https://voicelink-customer-itlull4k4-amrish369s-projects.vercel.app",
     ],
@@ -34,6 +42,13 @@ agent = VoiceLinkAgent()
 class ChatMessage(BaseModel):
     role: str
     content: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, value: str) -> str:
+        if value not in ("user", "assistant"):
+            raise ValueError("Invalid message role")
+        return value
 
 
 class LeadData(BaseModel):
@@ -62,7 +77,10 @@ class ConsentData(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
-    history: list[ChatMessage] = Field(default_factory=list, max_length=20)
+    history: list[ChatMessage] = Field(
+        default_factory=list,
+        max_length=20,
+    )
     lead: LeadData | None = None
     consent: ConsentData | None = None
 
@@ -77,8 +95,8 @@ async def save_lead(
     service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
     dealership_id = os.getenv("DEALERSHIP_ID", "")
 
-    if not (supabase_url and service_key and dealership_id):
-        raise RuntimeError("Lead storage is not configured")
+    if not all([supabase_url, service_key, dealership_id]):
+        raise RuntimeError("Supabase configuration is incomplete")
 
     payload: dict[str, Any] = {
         "p_dealership_id": dealership_id,
@@ -91,7 +109,9 @@ async def save_lead(
         "p_purchase_timeline": lead.purchase_timeline,
         "p_consent_source": consent.source,
         "p_consent_evidence": consent.evidence,
-        "p_messages": [item.model_dump() for item in history],
+        "p_messages": [
+            item.model_dump() for item in history
+        ],
     }
 
     headers = {
@@ -106,11 +126,18 @@ async def save_lead(
             headers=headers,
             json=payload,
         )
-        response.raise_for_status()
+
+        if response.status_code >= 400:
+            logger.error(
+                "Supabase lead save failed with HTTP %s",
+                response.status_code,
+            )
+            raise RuntimeError("Supabase lead save failed")
+
         result = response.json()
 
     if not isinstance(result, str) or not result:
-        raise RuntimeError("Invalid lead storage response")
+        raise RuntimeError("Invalid Supabase response")
 
     return result
 
@@ -120,6 +147,7 @@ async def home():
     return {
         "service": "VoiceLink AI Agent",
         "status": "running",
+        "version": "0.4.0",
     }
 
 
@@ -130,7 +158,9 @@ async def health():
 
 @app.get("/ready")
 async def ready():
-    configured = all(
+    ai_ready = agent.is_configured()
+
+    supabase_ready = all(
         os.getenv(key)
         for key in (
             "SUPABASE_URL",
@@ -140,7 +170,12 @@ async def ready():
     )
 
     return {
-        "status": "ready" if configured else "configuration_required"
+        "status": (
+            "ready" if ai_ready and supabase_ready
+            else "configuration_required"
+        ),
+        "ai_configured": ai_ready,
+        "supabase_configured": supabase_ready,
     }
 
 
@@ -150,10 +185,10 @@ async def chat(request: ChatRequest):
     if (request.lead is None) != (request.consent is None):
         raise HTTPException(
             status_code=422,
-            detail="Lead details and consent must be submitted together",
+            detail="Lead and consent must be submitted together",
         )
 
-    if request.consent is not None and not request.consent.granted:
+    if request.consent and not request.consent.granted:
         raise HTTPException(
             status_code=403,
             detail="Consent is required before saving a lead",
@@ -175,10 +210,26 @@ async def chat(request: ChatRequest):
             request.message,
             [item.model_dump() for item in request.history],
         )
-    except Exception:
+
+    except VoiceLinkConfigurationError:
+        logger.error("VoiceLink AI configuration is incomplete")
+        raise HTTPException(
+            status_code=503,
+            detail="AI service is not configured",
+        )
+
+    except VoiceLinkProviderError as exc:
+        logger.warning("VoiceLink AI provider error: %s", str(exc))
         raise HTTPException(
             status_code=502,
-            detail="AI provider request failed",
+            detail="AI provider is temporarily unavailable",
+        )
+
+    except Exception:
+        logger.exception("Unexpected VoiceLink chat error")
+        raise HTTPException(
+            status_code=500,
+            detail="Internal assistant error",
         )
 
     result: dict[str, Any] = {
@@ -196,9 +247,10 @@ async def chat(request: ChatRequest):
             result["lead_id"] = lead_id
 
         except Exception:
+            logger.exception("Lead saving failed")
             raise HTTPException(
                 status_code=502,
-                detail="Lead could not be saved. Check server configuration.",
+                detail="Lead could not be saved",
             )
 
     return result
