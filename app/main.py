@@ -5,6 +5,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
 from app.agent import VoiceLinkAgent
@@ -12,7 +13,19 @@ from app.agent import VoiceLinkAgent
 app = FastAPI(
     title="VoiceLink AI Agent",
     description="AI Sales Assistant for Dealerships",
-    version="0.3.0",
+    version="0.3.1",
+)
+
+# Allow requests from the VoiceLink customer website
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://voicelink-customer-amrish369s-projects.vercel.app",
+        "https://voicelink-customer-itlull4k4-amrish369s-projects.vercel.app",
+    ],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 agent = VoiceLinkAgent()
@@ -59,6 +72,7 @@ async def save_lead(
     consent: ConsentData,
     history: list[ChatMessage],
 ) -> str:
+
     supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
     service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
     dealership_id = os.getenv("DEALERSHIP_ID", "")
@@ -124,6 +138,7 @@ async def ready():
             "DEALERSHIP_ID",
         )
     )
+
     return {
         "status": "ready" if configured else "configuration_required"
     }
@@ -166,7 +181,7 @@ async def chat(request: ChatRequest):
             detail="AI provider request failed",
         )
 
-    result = {
+    result: dict[str, Any] = {
         "reply": reply,
         "agent": "VoiceLink",
     }
